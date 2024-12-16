@@ -593,6 +593,7 @@ frappe.ui.filter_utils = {
 				"Tomorrow",
 				"This",
 				"Next",
+				"In the past"
 			]);
 		}
 		if (condition === "is") {

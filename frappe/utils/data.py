@@ -32,6 +32,7 @@ from frappe.utils.number_format import NUMBER_FORMAT_MAP, NumberFormat
 DateTimeLikeObject = str | datetime.date | datetime.datetime
 NumericType = int | float
 TimespanOptions = Literal[
+	"in the past",
 	"last week",
 	"last month",
 	"last quarter",
@@ -372,7 +373,7 @@ def get_system_timezone() -> str:
 
 def convert_utc_to_timezone(utc_timestamp: datetime.datetime, time_zone: str) -> datetime.datetime:
 	if utc_timestamp.tzinfo is None:
-		utc_timestamp = utc_timestamp.replace(tzinfo=ZoneInfo("UTC"))
+		utc_timestamp = utc_timestamp.replace(tzinfo=ZoneInfo(time_zone))
 
 	try:
 		return utc_timestamp.astimezone(ZoneInfo(time_zone))
@@ -948,6 +949,11 @@ def get_timespan_date_range(
 			return (
 				get_quarter_start(add_to_date(today, months=3)),
 				get_quarter_ending(add_to_date(today, months=6)),
+			)
+		case "in the past":
+			return (
+				get_first_day(add_to_date(today, years=-99)),
+				add_to_date(today, days=-1),
 			)
 		case "next year":
 			return (
