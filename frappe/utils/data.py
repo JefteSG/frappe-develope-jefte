@@ -373,7 +373,7 @@ def get_system_timezone() -> str:
 
 def convert_utc_to_timezone(utc_timestamp: datetime.datetime, time_zone: str) -> datetime.datetime:
 	if utc_timestamp.tzinfo is None:
-		utc_timestamp = utc_timestamp.replace(tzinfo=ZoneInfo(time_zone))
+		utc_timestamp = utc_timestamp.replace(tzinfo=ZoneInfo("UTC"))
 
 	try:
 		return utc_timestamp.astimezone(ZoneInfo(time_zone))
