@@ -110,6 +110,7 @@ class TestRedisCache(FrappeAPITestCase):
 		self.assertEqual(function_call_count, 1)
 
 		time.sleep(CACHE_TTL * 1.5)
+		frappe.local.cache.clear()
 		self.assertEqual(calculate_area(10), 314)
 		self.assertEqual(function_call_count, 2)
 
@@ -348,3 +349,13 @@ class TestRedisWrapper(FrappeAPITestCase):
 
 	def test_backward_compat_cache(self):
 		self.assertEqual(frappe.cache, frappe.cache())
+
+
+class TestHttpCache(FrappeAPITestCase):
+	def test_http_headers(self):
+		resp = self.get(
+			self.method("frappe.client.is_document_amended"),
+			{"sid": self.sid, "doctype": "User", "docname": "Guest"},
+		)
+		self.assertEqual(resp.cache_control.max_age, 600)
+		self.assertTrue(resp.cache_control.private)

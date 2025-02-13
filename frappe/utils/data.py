@@ -13,6 +13,7 @@ import time
 import typing
 from code import compile_command
 from enum import Enum
+from functools import lru_cache
 from typing import Any, Literal, Optional, TypeVar
 from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse, urlunparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -113,21 +114,27 @@ def getdate(
 	"""
 	if not string_date:
 		return get_datetime().date()
-	if isinstance(string_date, datetime.datetime):
+	elif isinstance(string_date, datetime.datetime):
 		return string_date.date()
 
 	elif isinstance(string_date, datetime.date):
 		return string_date
 
-	if is_invalid_date_string(string_date):
+	elif is_invalid_date_string(string_date):
 		return None
+
 	try:
-		return parser.parse(string_date, dayfirst=parse_day_first).date()
-	except ParserError:
-		frappe.throw(
-			frappe._("{} is not a valid date string.").format(frappe.bold(string_date)),
-			title=frappe._("Invalid Date"),
-		)
+		# PERF: Our DATE_FORMAT is same as ISO format.
+		# fromisoformat is written in C so it's better than using strptime parser
+		return datetime.date.fromisoformat(string_date)
+	except ValueError:
+		try:
+			return parser.parse(string_date, dayfirst=parse_day_first).date()
+		except ParserError:
+			frappe.throw(
+				frappe._("{} is not a valid date string.").format(frappe.bold(string_date)),
+				title=frappe._("Invalid Date"),
+			)
 
 
 def get_datetime(
@@ -147,7 +154,7 @@ def get_datetime(
 	if datetime_str is None:
 		return now_datetime()
 
-	if isinstance(datetime_str, datetime.datetime | datetime.timedelta):
+	elif isinstance(datetime_str, datetime.datetime | datetime.timedelta):
 		return datetime_str
 
 	elif isinstance(datetime_str, list | tuple):
@@ -156,11 +163,13 @@ def get_datetime(
 	elif isinstance(datetime_str, datetime.date):
 		return datetime.datetime.combine(datetime_str, datetime.time())
 
-	if is_invalid_date_string(datetime_str):
+	elif is_invalid_date_string(datetime_str):
 		return None
 
 	try:
-		return datetime.datetime.strptime(datetime_str, DATETIME_FORMAT)
+		# PERF: Our DATETIME_FORMAT is same as ISO format.
+		# fromisoformat is written in C so it's better than using strptime parser
+		return datetime.datetime.fromisoformat(datetime_str)
 	except ValueError:
 		return parser.parse(datetime_str)
 
@@ -261,7 +270,7 @@ def add_to_date(
 
 
 def add_to_date(
-	date: DateTimeLikeObject,
+	date: DateTimeLikeObject | None = None,
 	years=0,
 	months=0,
 	weeks=0,
@@ -285,7 +294,7 @@ def add_to_date(
 		if " " in date:
 			as_datetime = True
 		try:
-			date = parser.parse(date)
+			date = get_datetime(date)
 		except ParserError:
 			frappe.throw(frappe._("Please select a valid date filter"), title=frappe._("Invalid Date"))
 
@@ -890,6 +899,14 @@ def get_timespan_date_range(
 	today = getdate()
 
 	match timespan:
+		case "last 7 days":
+			return (add_to_date(today, days=-7), today)
+		case "last 14 days":
+			return (add_to_date(today, days=-14), today)
+		case "last 30 days":
+			return (add_to_date(today, days=-30), today)
+		case "last 90 days":
+			return (add_to_date(today, days=-90), today)
 		case "last week":
 			return (
 				get_first_day_of_week(add_to_date(today, days=-7)),
@@ -930,6 +947,21 @@ def get_timespan_date_range(
 			return (get_quarter_start(today), get_quarter_ending(today))
 		case "this year":
 			return (get_year_start(today), get_year_ending(today))
+		case "next 7 days":
+			return (
+				today,
+				add_to_date(today, days=7),
+			)
+		case "next 14 days":
+			return (
+				today,
+				add_to_date(today, days=14),
+			)
+		case "next 30 days":
+			return (
+				today,
+				add_to_date(today, days=30),
+			)
 		case "next week":
 			return (
 				get_first_day_of_week(add_to_date(today, days=7)),
@@ -1203,10 +1235,10 @@ def rounded(num, precision=0, rounding_method=None):
 		rounding_method or frappe.get_system_settings("rounding_method") or "Banker's Rounding (legacy)"
 	)
 
-	if rounding_method == "Banker's Rounding (legacy)":
-		return _bankers_rounding_legacy(num, precision)
-	elif rounding_method == "Banker's Rounding":
+	if rounding_method == "Banker's Rounding":
 		return _bankers_rounding(num, precision)
+	elif rounding_method == "Banker's Rounding (legacy)":
+		return _bankers_rounding_legacy(num, precision)
 	elif rounding_method == "Commercial Rounding":
 		return _round_away_from_zero(num, precision)
 	else:
@@ -1677,8 +1709,8 @@ def pretty_date(iso_datetime: datetime.datetime | str) -> str:
 	from babel.dates import format_timedelta
 
 	if isinstance(iso_datetime, str):
-		iso_datetime = datetime.datetime.strptime(iso_datetime, DATETIME_FORMAT)
-	now_dt = datetime.datetime.strptime(now(), DATETIME_FORMAT)
+		iso_datetime = get_datetime(iso_datetime)
+	now_dt = now_datetime()
 	locale = frappe.local.lang.replace("-", "_") if frappe.local.lang else None
 	return format_timedelta(iso_datetime - now_dt, add_direction=True, locale=locale)
 
@@ -2105,12 +2137,17 @@ def make_filter_dict(filters):
 
 
 def sanitize_column(column_name: str) -> None:
+	return _sanitize_column(column_name, (frappe.db and frappe.db.db_type) or None)
+
+
+@lru_cache(maxsize=1024)
+def _sanitize_column(column_name: str, db_type: str) -> None:
 	import sqlparse
 
 	from frappe import _
 
 	column_name = sqlparse.format(column_name, strip_comments=True, keyword_case="lower")
-	if frappe.db and frappe.db.db_type == "mariadb":
+	if db_type == "mariadb":
 		# strip mariadb specific comments which are like python single line comments
 		column_name = MARIADB_SPECIFIC_COMMENT.sub("", column_name)
 
@@ -2129,7 +2166,7 @@ def sanitize_column(column_name: str) -> None:
 	def _raise_exception():
 		frappe.throw(_("Invalid field name {0}").format(column_name), frappe.DataError)
 
-	regex = re.compile("^.*[,'();].*")
+	regex = re.compile("^.*[,'();\n].*")
 	if "ifnull" in column_name:
 		if regex.match(column_name):
 			# to avoid and, or
@@ -2138,6 +2175,11 @@ def sanitize_column(column_name: str) -> None:
 
 			# to avoid select, delete, drop, update and case
 			elif any(keyword in column_name.split() for keyword in blacklisted_keywords):
+				_raise_exception()
+
+			elif any(
+				re.search(rf"\b{keyword}\b", column_name, re.IGNORECASE) for keyword in blacklisted_keywords
+			):
 				_raise_exception()
 
 	elif regex.match(column_name):
@@ -2584,6 +2626,40 @@ def map_trackers(url_trackers: dict, create: bool = False):
 		frappe_trackers["utm_content"] = url_content
 
 	return frappe_trackers
+
+
+def bold(text: str | int | float) -> str:
+	"""Return `text` wrapped in `<strong>` tags."""
+	return f"<strong>{text}</strong>"
+
+
+def safe_encode(param, encoding="utf-8"):
+	try:
+		param = param.encode(encoding)
+	except Exception:
+		pass
+	return param
+
+
+def safe_decode(param, encoding="utf-8", fallback_map: dict | None = None):
+	"""
+	Method to safely decode data into a string
+
+	:param param: The data to be decoded
+	:param encoding: The encoding to decode into
+	:param fallback_map: A fallback map to reference in case of a LookupError
+	:return:
+	"""
+	try:
+		param = param.decode(encoding)
+	except LookupError:
+		try:
+			param = param.decode((fallback_map or {}).get(encoding, "utf-8"))
+		except Exception:
+			pass
+	except Exception:
+		pass
+	return param
 
 
 # This is used in test to count memory overhead of default imports.

@@ -83,7 +83,7 @@ class Monitor:
 			self.data.job.scheduled = True
 
 		if job := rq.get_current_job():
-			self.data.uuid = job.id
+			self.data.job_id = job.id
 			waitdiff = self.data.timestamp - job.enqueued_at.replace(tzinfo=datetime.timezone.utc)
 			self.data.job.wait = int(waitdiff.total_seconds() * 1000000)
 
@@ -127,7 +127,7 @@ def flush():
 		logs = frappe.cache.lrange(MONITOR_REDIS_KEY, 0, -1)
 		if logs:
 			logs = list(map(frappe.safe_decode, logs))
-			with open(log_file(), "a", os.O_NONBLOCK) as f:
+			with open(log_file(), "a") as f:
 				f.write("\n".join(logs))
 				f.write("\n")
 			# Remove fetched entries from cache

@@ -12,17 +12,13 @@ Read the documentation: https://frappeframework.com/docs
 """
 
 import copy
-import faulthandler
 import functools
-import gc
 import importlib
 import inspect
 import json
 import os
-import re
-import signal
 import sys
-import traceback
+import threading
 import warnings
 from collections import defaultdict
 from collections.abc import Callable, Iterable
@@ -39,6 +35,7 @@ from typing import (
 )
 
 import click
+from werkzeug.datastructures import Headers
 from werkzeug.local import Local, LocalProxy, release_local
 
 import frappe
@@ -49,9 +46,7 @@ from frappe.query_builder.utils import (
 	patch_query_execute,
 )
 from frappe.utils.caching import request_cache
-from frappe.utils.data import cint, cstr, sbool
-
-from .bench_interface import Bench
+from frappe.utils.data import bold, cint, cstr, safe_decode, safe_encode, sbool
 
 # Local application imports
 from .exceptions import *
@@ -79,21 +74,41 @@ if TYPE_CHECKING:  # pragma: no cover
 	from frappe.model.document import Document
 	from frappe.query_builder.builder import MariaDB, Postgres
 	from frappe.types.lazytranslatedstring import _LazyTranslate
-	from frappe.utils.redis_wrapper import RedisWrapper
+	from frappe.utils.redis_wrapper import ClientCache, RedisWrapper
 
 controllers: dict[str, "Document"] = {}
 local = Local()
-bench = Bench()
 cache: Optional["RedisWrapper"] = None
+client_cache: Optional["ClientCache"] = None
 STANDARD_USERS = ("Guest", "Administrator")
 
-_qb_patched: dict[str, bool] = {}
+_one_time_setup: dict[str, bool] = {}
 _dev_server = int(sbool(os.environ.get("DEV_SERVER", False)))
-_tune_gc = bool(sbool(os.environ.get("FRAPPE_TUNE_GC", True)))
 
 if _dev_server:
 	warnings.simplefilter("always", DeprecationWarning)
 	warnings.simplefilter("always", PendingDeprecationWarning)
+
+
+def _get_local_proxy(self: Local, name: str) -> LocalProxy:
+	"""Get local proxy object by name."""
+
+	_local_contextvar = self._Local__storage
+
+	def _get_current_object() -> Any:
+		obj = _local_contextvar.get(None)
+
+		if obj is not None and name in obj:
+			return obj[name]
+
+		raise RuntimeError("object is not bound") from None
+
+	lp = LocalProxy(_get_current_object)
+	object.__setattr__(lp, "_get_current_object", _get_current_object)
+	return lp
+
+
+Local.__call__ = _get_local_proxy
 
 
 def _(msg: str, lang: str | None = None, context: str | None = None) -> str:
@@ -250,14 +265,16 @@ def init(site: str, sites_path: str = ".", new_site: bool = False, force: bool =
 	local.site = site
 	local.site_name = site  # implicitly scopes bench
 	local.sites_path = sites_path
-	local.site_path = os.path.join(sites_path, site)
+	site_path = os.path.join(sites_path, site)
+	local.site_path = site_path
 	local.all_apps = None
 
 	local.request_ip = None
 	local.response = _dict({"docs": []})
+	local.response_headers = Headers()
 	local.task_id = None
 
-	local.conf = _dict(get_site_config())
+	local.conf = get_site_config(sites_path=sites_path, site_path=site_path, cached=bool(frappe.request))
 	local.lang = local.conf.lang or "en"
 
 	local.module_app = None
@@ -270,6 +287,7 @@ def init(site: str, sites_path: str = ".", new_site: bool = False, force: bool =
 	local.valid_columns = {}
 	local.new_doc_templates = {}
 
+	local.request_cache = defaultdict(dict)
 	local.jenv = None
 	local.jloader = None
 	local.cache = {}
@@ -279,12 +297,14 @@ def init(site: str, sites_path: str = ".", new_site: bool = False, force: bool =
 	local.dev_server = _dev_server
 	local.qb = get_query_builder(local.conf.db_type)
 	local.qb.get_query = get_query
-	setup_redis_cache_connection()
+	if not cache or not client_cache:
+		setup_redis_cache_connection()
 
-	if not _qb_patched.get(local.conf.db_type):
+	if not _one_time_setup.get(local.conf.db_type):
 		patch_query_execute()
 		patch_query_aggregation()
-		_register_fault_handler()
+		frappe._optimizations.register_fault_handler()
+		_one_time_setup[local.conf.db_type] = True
 
 	setup_module_map(include_all_apps=not (frappe.request or frappe.job or frappe.flags.in_migrate))
 
@@ -366,107 +386,6 @@ def connect_replica() -> bool:
 	return True
 
 
-def get_site_config(sites_path: str | None = None, site_path: str | None = None) -> _dict[str, Any]:
-	"""Return `site_config.json` combined with `sites/common_site_config.json`.
-	`site_config` is a set of site wide settings like database name, password, email etc."""
-	config: _dict[str, Any] = _dict()
-
-	sites_path = sites_path or getattr(local, "sites_path", None)
-	site_path = site_path or getattr(local, "site_path", None)
-
-	common_config = get_common_site_config(sites_path)
-
-	if sites_path:
-		config.update(common_config)
-
-	if site_path:
-		site_config = os.path.join(site_path, "site_config.json")
-		if os.path.exists(site_config):
-			try:
-				config.update(get_file_json(site_config))
-			except Exception as error:
-				click.secho(f"{local.site}/site_config.json is invalid", fg="red")
-				print(error)
-		elif local.site and not local.flags.new_site:
-			error_msg = f"{local.site} does not exist."
-			if common_config.developer_mode:
-				from frappe.utils import get_sites
-
-				all_sites = get_sites()
-				error_msg += "\n\nSites on this bench:\n"
-				error_msg += "\n".join(f"* {site}" for site in all_sites)
-
-			raise IncorrectSitePath(error_msg)
-
-	# Generalized env variable overrides and defaults
-	def db_default_ports(db_type):
-		if db_type == "mariadb":
-			from frappe.database.mariadb.database import MariaDBDatabase
-
-			return MariaDBDatabase.default_port
-		elif db_type == "postgres":
-			from frappe.database.postgres.database import PostgresDatabase
-
-			return PostgresDatabase.default_port
-
-		raise ValueError(f"Unsupported db_type={db_type}")
-
-	config["redis_queue"] = (
-		os.environ.get("FRAPPE_REDIS_QUEUE") or config.get("redis_queue") or "redis://127.0.0.1:11311"
-	)
-	config["redis_cache"] = (
-		os.environ.get("FRAPPE_REDIS_CACHE") or config.get("redis_cache") or "redis://127.0.0.1:13311"
-	)
-	config["db_type"] = os.environ.get("FRAPPE_DB_TYPE") or config.get("db_type") or "mariadb"
-	config["db_socket"] = os.environ.get("FRAPPE_DB_SOCKET") or config.get("db_socket")
-	config["db_host"] = os.environ.get("FRAPPE_DB_HOST") or config.get("db_host") or "127.0.0.1"
-	config["db_port"] = int(
-		os.environ.get("FRAPPE_DB_PORT") or config.get("db_port") or db_default_ports(config["db_type"])
-	)
-
-	# Set the user as database name if not set in config
-	config["db_user"] = os.environ.get("FRAPPE_DB_USER") or config.get("db_user") or config.get("db_name")
-
-	# vice versa for dbname if not defined
-	config["db_name"] = os.environ.get("FRAPPE_DB_NAME") or config.get("db_name") or config["db_user"]
-
-	# read password
-	config["db_password"] = os.environ.get("FRAPPE_DB_PASSWORD") or config.get("db_password")
-
-	# Allow externally extending the config with hooks
-	if extra_config := config.get("extra_config"):
-		if isinstance(extra_config, str):
-			extra_config = [extra_config]
-		for hook in extra_config:
-			try:
-				module, method = hook.rsplit(".", 1)
-				config |= getattr(importlib.import_module(module), method)()
-			except Exception:
-				print(f"Config hook {hook} failed")
-				traceback.print_exc()
-
-	return config
-
-
-def get_common_site_config(sites_path: str | None = None) -> _dict[str, Any]:
-	"""Return common site config as dictionary.
-
-	This is useful for:
-	- checking configuration which should only be allowed in common site config
-	- When no site context is present and fallback is required.
-	"""
-	sites_path = sites_path or getattr(local, "sites_path", None)
-
-	common_site_config = os.path.join(sites_path, "common_site_config.json")
-	if os.path.exists(common_site_config):
-		try:
-			return _dict(get_file_json(common_site_config))
-		except Exception as error:
-			click.secho("common_site_config.json is invalid", fg="red")
-			print(error)
-	return _dict()
-
-
 def get_conf(site: str | None = None) -> _dict[str, Any]:
 	if hasattr(local, "conf"):
 		return local.conf
@@ -497,14 +416,21 @@ def destroy():
 	release_local(local)
 
 
+_redis_init_lock = threading.Lock()
+
+
 def setup_redis_cache_connection():
 	"""Defines `frappe.cache` as `RedisWrapper` instance"""
+	from frappe.utils.redis_wrapper import ClientCache, setup_cache
+
 	global cache
+	global client_cache
 
-	if not cache:
-		from frappe.utils.redis_wrapper import setup_cache
-
-		cache = setup_cache()
+	with _redis_init_lock:
+		# We need to check again since someone else might have setup connection before us.
+		if not cache:
+			cache = setup_cache()
+			client_cache = ClientCache()
 
 
 def get_traceback(with_context: bool = False) -> str:
@@ -526,7 +452,10 @@ def errprint(msg: str) -> None:
 
 
 def print_sql(enable: bool = True) -> None:
-	return cache.set_value("flag_print_sql", enable)
+	if frappe.conf.allow_tests and frappe.conf.developer_mode:
+		cache.set_value("flag_print_sql", enable)
+	else:
+		frappe.throw("`frappe.print_sql` only works in `developer_mode` with `allow_tests` enabled on site.")
 
 
 def log(msg: str) -> None:
@@ -1037,46 +966,6 @@ def get_domain_data(module):
 			raise
 
 
-def clear_cache(user: str | None = None, doctype: str | None = None):
-	"""Clear **User**, **DocType** or global cache.
-
-	:param user: If user is given, only user cache is cleared.
-	:param doctype: If doctype is given, only DocType cache is cleared."""
-	import frappe.cache_manager
-	import frappe.utils.caching
-	from frappe.website.router import clear_routing_cache
-
-	if doctype:
-		frappe.cache_manager.clear_doctype_cache(doctype)
-		reset_metadata_version()
-	elif user:
-		frappe.cache_manager.clear_user_cache(user)
-	else:  # everything
-		# Delete ALL keys associated with this site.
-		keys_to_delete = set(frappe.cache.get_keys(""))
-		for key in frappe.get_hooks("persistent_cache_keys"):
-			keys_to_delete.difference_update(frappe.cache.get_keys(key))
-		frappe.cache.delete_value(list(keys_to_delete), make_keys=False)
-
-		reset_metadata_version()
-		local.cache = {}
-		local.new_doc_templates = {}
-
-		for fn in get_hooks("clear_cache"):
-			get_attr(fn)()
-
-	frappe.utils.caching._SITE_CACHE.clear()
-	local.role_permissions = {}
-	if hasattr(local, "request_cache"):
-		local.request_cache.clear()
-	if hasattr(local, "system_settings"):
-		del local.system_settings
-	if hasattr(local, "website_settings"):
-		del local.website_settings
-
-	clear_routing_cache()
-
-
 def only_has_select_perm(doctype, user=None, ignore_permissions=False):
 	if ignore_permissions:
 		return False
@@ -1174,11 +1063,11 @@ def has_website_permission(doc=None, ptype="read", user=None, verbose=False, doc
 
 def is_table(doctype: str) -> bool:
 	"""Return True if `istable` property (indicating child Table) is set for given DocType."""
-
-	def get_tables():
-		return db.get_values("DocType", filters={"istable": 1}, order_by=None, pluck=True)
-
-	tables = cache.get_value("is_table", get_tables)
+	key = "is_table"
+	tables = client_cache.get_value(key)
+	if tables is None:
+		tables = db.get_values("DocType", filters={"istable": 1}, order_by=None, pluck=True)
+		client_cache.set_value(key, tables)
 	return doctype in tables
 
 
@@ -1204,13 +1093,6 @@ def generate_hash(txt: str | None = None, length: int = 56) -> str:
 		)
 
 	return secrets.token_hex(math.ceil(length / 2))[:length]
-
-
-def reset_metadata_version():
-	"""Reset `metadata_version` (Client (Javascript) build ID) hash."""
-	v = generate_hash()
-	cache.set_value("metadata_version", v)
-	return v
 
 
 def new_doc(
@@ -1262,7 +1144,7 @@ def get_cached_doc(*args: Any, **kwargs: Any) -> "Document":
 
 
 def _set_document_in_cache(key: str, doc: "Document") -> None:
-	cache.set_value(key, doc)
+	cache.set_value(key, doc, expires_in_sec=3600)
 
 
 def can_cache_doc(args) -> str | None:
@@ -1378,13 +1260,7 @@ def get_doc(*args: Any, **kwargs: Any) -> "Document":
 	"""
 	import frappe.model.document
 
-	doc = frappe.model.document.get_doc(*args, **kwargs)
-
-	# Replace cache if stale one exists
-	if not kwargs.get("for_update") and (key := can_cache_doc(args)) and cache.exists(key):
-		_set_document_in_cache(key, doc)
-
-	return doc
+	return frappe.model.document.get_doc(*args, **kwargs)
 
 
 def get_last_doc(
@@ -1689,16 +1565,18 @@ def get_hooks(
 	:param app_name: Filter by app."""
 
 	if app_name:
-		hooks = _dict(_load_app_hooks(app_name))
+		hooks = _load_app_hooks(app_name)
 	else:
 		if conf.developer_mode:
-			hooks = _dict(_load_app_hooks())
+			hooks = _load_app_hooks()
 		else:
-			hooks = _dict(cache.get_value("app_hooks", _load_app_hooks))
-
+			hooks = client_cache.get_value("app_hooks")
+			if hooks is None:
+				hooks = _load_app_hooks()
+				client_cache.set_value("app_hooks", hooks)
 	if hook:
 		return hooks.get(hook, ([] if default == "_KEEP_DEFAULT_LIST" else default))
-	return hooks
+	return _dict(hooks)
 
 
 def append_hook(target, key, value):
@@ -1732,7 +1610,7 @@ def setup_module_map(include_all_apps: bool = True) -> None:
 	if include_all_apps:
 		local.app_modules = cache.get_value("app_modules")
 	else:
-		local.app_modules = cache.get_value("installed_app_modules")
+		local.app_modules = client_cache.get_value("installed_app_modules")
 
 	if not local.app_modules:
 		local.app_modules = {}
@@ -1750,7 +1628,7 @@ def setup_module_map(include_all_apps: bool = True) -> None:
 		if include_all_apps:
 			cache.set_value("app_modules", local.app_modules)
 		else:
-			cache.set_value("installed_app_modules", local.app_modules)
+			client_cache.set_value("installed_app_modules", local.app_modules)
 
 	# Init module_app (reverse mapping)
 	local.module_app = {}
@@ -1822,6 +1700,9 @@ def call(fn: str | Callable, *args, **kwargs):
 	return fn(*args, **newargs)
 
 
+_cached_inspect_signature = functools.lru_cache(inspect.signature)
+
+
 def get_newargs(fn: Callable, kwargs: dict[str, Any]) -> dict[str, Any]:
 	"""Remove any kwargs that are not supported by the function.
 
@@ -1837,7 +1718,7 @@ def get_newargs(fn: Callable, kwargs: dict[str, Any]) -> dict[str, Any]:
 	# Ref: https://docs.python.org/3/library/inspect.html#inspect.Parameter.kind
 	varkw_exist = False
 
-	signature = inspect.signature(fn)
+	signature = _cached_inspect_signature(fn)
 	fnargs = list(signature.parameters)
 
 	for param_name, parameter in signature.parameters.items():
@@ -2414,11 +2295,6 @@ def get_desk_link(doctype, name):
 	return html.format(doctype=doctype, name=name, doctype_local=_(doctype), title_local=_(title))
 
 
-def bold(text: str | int | float) -> str:
-	"""Return `text` wrapped in `<strong>` tags."""
-	return f"<strong>{text}</strong>"
-
-
 def safe_eval(code, eval_globals=None, eval_locals=None):
 	"""A safer `eval`"""
 
@@ -2430,24 +2306,12 @@ def safe_eval(code, eval_globals=None, eval_locals=None):
 def get_website_settings(key):
 	if not hasattr(local, "website_settings"):
 		try:
-			local.website_settings = get_cached_doc("Website Settings")
+			local.website_settings = client_cache.get_doc("Website Settings")
 		except DoesNotExistError:
 			clear_last_message()
 			return
 
 	return local.website_settings.get(key)
-
-
-def get_system_settings(key: str):
-	"""Return the value associated with the given `key` from System Settings DocType."""
-	if not hasattr(local, "system_settings"):
-		try:
-			local.system_settings = get_cached_doc("System Settings")
-		except DoesNotExistError:  # possible during new install
-			clear_last_message()
-			return
-
-	return local.system_settings.get(key)
 
 
 def get_active_domains():
@@ -2456,94 +2320,9 @@ def get_active_domains():
 	return get_active_domains()
 
 
-def get_version(doctype, name, limit=None, head=False, raise_err=True):
-	"""
-	Return a list of version information for the given DocType.
-
-	Note: Applicable only if DocType has changes tracked.
-
-	Example
-	>>> frappe.get_version("User", "foobar@gmail.com")
-	>>>
-	[
-	        {
-	                "version": [version.data],			# Refer Version DocType get_diff method and data attribute
-	                "user": "admin@gmail.com",			# User that created this version
-	                "creation": <datetime.datetime>		# Creation timestamp of that object.
-	        }
-	]
-	"""
-	meta = get_meta(doctype)
-	if meta.track_changes:
-		names = get_all(
-			"Version",
-			filters={
-				"ref_doctype": doctype,
-				"docname": name,
-				"order_by": "creation" if head else None,
-				"limit": limit,
-			},
-			as_list=1,
-		)
-
-		from frappe.utils import dictify, safe_json_loads, squashify
-
-		versions = []
-
-		for name in names:
-			name = squashify(name)
-			doc = get_doc("Version", name)
-
-			data = doc.data
-			data = safe_json_loads(data)
-			data = dictify(dict(version=data, user=doc.owner, creation=doc.creation))
-
-			versions.append(data)
-
-		return versions
-	else:
-		if raise_err:
-			raise ValueError(_("{0} has no versions tracked.").format(doctype))
-
-
 @whitelist(allow_guest=True)
 def ping():
 	return "pong"
-
-
-def safe_encode(param, encoding="utf-8"):
-	try:
-		param = param.encode(encoding)
-	except Exception:
-		pass
-	return param
-
-
-def safe_decode(param, encoding="utf-8", fallback_map: dict | None = None):
-	"""
-	Method to safely decode data into a string
-
-	:param param: The data to be decoded
-	:param encoding: The encoding to decode into
-	:param fallback_map: A fallback map to reference in case of a LookupError
-	:return:
-	"""
-	try:
-		param = param.decode(encoding)
-	except LookupError:
-		try:
-			param = param.decode((fallback_map or {}).get(encoding, "utf-8"))
-		except Exception:
-			pass
-	except Exception:
-		pass
-	return param
-
-
-def parse_json(val):
-	from frappe.utils import parse_json
-
-	return parse_json(val)
 
 
 def mock(type, size=1, locale="en"):
@@ -2581,24 +2360,13 @@ def validate_and_sanitize_search_inputs(fn):
 	return wrapper
 
 
-def _register_fault_handler():
-	import io
+import frappe._optimizations
+from frappe.cache_manager import clear_cache, reset_metadata_version
 
-	# Some libraries monkey patch stderr, we need actual fd
-	if isinstance(sys.__stderr__, io.TextIOWrapper):
-		faulthandler.register(signal.SIGUSR1, file=sys.__stderr__)
-
-
+# Backward compatibility
+from frappe.config import get_common_site_config, get_site_config
+from frappe.core.doctype.system_settings.system_settings import get_system_settings
+from frappe.utils import parse_json
 from frappe.utils.error import log_error
 
-if _tune_gc:
-	# generational GC gets triggered after certain allocs (g0) which is 700 by default.
-	# This number is quite small for frappe where a single query can potentially create 700+
-	# objects easily.
-	# Bump this number higher, this will make GC less aggressive but that improves performance of
-	# everything else.
-	g0, g1, g2 = gc.get_threshold()  # defaults are 700, 10, 10.
-	gc.set_threshold(g0 * 10, g1 * 2, g2 * 2)
-
-# Remove references to pattern that are pre-compiled and loaded to global scopes.
-re.purge()
+frappe._optimizations.optimize_all()

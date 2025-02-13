@@ -208,7 +208,7 @@ frappe.ui.form.Toolbar = class Toolbar {
 				let label = __("New Name");
 				if (me.frm.meta.autoname && me.frm.meta.autoname.startsWith("field:")) {
 					let fieldname = me.frm.meta.autoname.split(":")[1];
-					label = __("New {0}", [me.frm.get_docfield(fieldname).label]);
+					label = __("New {0}", [__(me.frm.get_docfield(fieldname).label)]);
 				}
 
 				fields.push(
@@ -660,10 +660,15 @@ frappe.ui.form.Toolbar = class Toolbar {
 			if (status !== this.current_status && status === "Amend") {
 				let doc = this.frm.doc;
 				frappe
-					.xcall("frappe.client.is_document_amended", {
-						doctype: doc.doctype,
-						docname: doc.name,
-					})
+					.xcall(
+						"frappe.client.is_document_amended",
+						{
+							doctype: doc.doctype,
+							docname: doc.name,
+						},
+						"GET",
+						{ cache: true }
+					)
 					.then((is_amended) => {
 						if (is_amended) {
 							this.page.clear_actions();

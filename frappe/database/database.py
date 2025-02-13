@@ -47,7 +47,7 @@ INDEX_PATTERN = re.compile(r"\s*\([^)]+\)\s*")
 SINGLE_WORD_PATTERN = re.compile(r'([`"]?)(tab([A-Z]\w+))\1')
 MULTI_WORD_PATTERN = re.compile(r'([`"])(tab([A-Z]\w+)( [A-Z]\w+)+)\1')
 
-SQL_ITERATOR_BATCH_SIZE = 100
+SQL_ITERATOR_BATCH_SIZE = 1000
 
 
 TRANSACTION_DISABLED_MSG = """Commit/rollback are disabled during certain events. This command will
@@ -339,7 +339,11 @@ class Database:
 		"""Takes the query and logs it to various interfaces according to the settings."""
 		_query = None
 
-		if frappe.conf.allow_tests and frappe.cache.get_value("flag_print_sql"):
+		if (
+			frappe.conf.allow_tests
+			and frappe.conf.developer_mode
+			and frappe.cache.get_value("flag_print_sql")
+		):
 			_query = _query or str(mogrified_query)
 			print(_query)
 
@@ -460,7 +464,7 @@ class Database:
 	@staticmethod
 	def clear_db_table_cache(query):
 		if query and is_query_type(query, ("drop", "create")):
-			frappe.cache.delete_key("db_tables")
+			frappe.client_cache.delete_value("db_tables")
 
 	def get_description(self):
 		"""Return result metadata."""
@@ -1246,6 +1250,10 @@ class Database:
 			frappe.cache.set_value(f"doctype:count:{dt}", count, expires_in_sec=86400)
 		return count
 
+	def estimate_count(self, doctype: str) -> int:
+		"""Get estimated count of total rows in a table."""
+		raise NotImplementedError
+
 	@staticmethod
 	def format_date(date):
 		return getdate(date).strftime("%Y-%m-%d")
@@ -1274,7 +1282,8 @@ class Database:
 
 	def get_db_table_columns(self, table) -> list[str]:
 		"""Return list of column names from given table."""
-		columns = frappe.cache.hget("table_columns", table)
+		key = f"table_columns::{table}"
+		columns = frappe.client_cache.get_value(key)
 		if columns is None:
 			information_schema = frappe.qb.Schema("information_schema")
 
@@ -1286,7 +1295,7 @@ class Database:
 			)
 
 			if columns:
-				frappe.cache.hset("table_columns", table, columns)
+				frappe.cache.set_value(key, columns)
 
 		return columns
 

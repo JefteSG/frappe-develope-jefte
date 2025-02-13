@@ -24,9 +24,12 @@ frappe.views.ListView = class ListView extends frappe.views.BaseList {
 	constructor(opts) {
 		super(opts);
 		this.show();
+		const meta = frappe.get_meta(this.doctype);
+		this.is_large_table = meta?.is_large_table;
+
 		this.debounced_refresh = frappe.utils.debounce(
 			this.process_document_refreshes.bind(this),
-			2000
+			this.is_large_table ? 15000 : 2000
 		);
 		this.count_upper_bound = 1001;
 		this._element_factory = new ElementFactory(this.doctype);
@@ -105,9 +108,23 @@ frappe.views.ListView = class ListView extends frappe.views.BaseList {
 				return f;
 			});
 		}
+		this.add_recent_filter_on_large_tables();
 
 		this.patch_refresh_and_load_lib();
 		return this.get_list_view_settings();
+	}
+
+	add_recent_filter_on_large_tables() {
+		if (!this.is_large_table) {
+			return;
+		}
+		// Note: versions older than v16 should use "modified" here.
+		const recency_field = "creation";
+
+		if (this.filters.filter((arr) => arr?.includes(recency_field)).length) {
+			return;
+		}
+		this.filters.push([this.doctype, recency_field, "Timespan", "last 90 days"]);
 	}
 
 	on_sort_change(sort_by, sort_order) {
@@ -518,6 +535,7 @@ frappe.views.ListView = class ListView extends frappe.views.BaseList {
 	before_refresh() {
 		if (frappe.route_options && this.filter_area) {
 			this.filters = this.parse_filters_from_route_options();
+			this.add_recent_filter_on_large_tables();
 			frappe.route_options = null;
 
 			if (this.filters.length > 0) {
@@ -620,7 +638,7 @@ frappe.views.ListView = class ListView extends frappe.views.BaseList {
 		let $count = this.get_count_element();
 		this.get_count_str().then((count) => {
 			$count.html(`<span>${count}</span>`);
-			if (this.count_upper_bound && this.count_upper_bound == this.total_count) {
+			if (this.count_upper_bound) {
 				$count.attr(
 					"title",
 					__(
@@ -628,12 +646,14 @@ frappe.views.ListView = class ListView extends frappe.views.BaseList {
 					)
 				);
 				$count.tooltip({ delay: { show: 600, hide: 100 }, trigger: "hover" });
+				$count.css("cursor", "pointer");
 				$count.on("click", () => {
 					me.count_upper_bound = 0;
 					$count.off("click");
 					$count.tooltip("disable");
 					me.freeze();
 					me.render_count();
+					$count.css("cursor", "");
 				});
 			}
 		});
@@ -1008,18 +1028,24 @@ frappe.views.ListView = class ListView extends frappe.views.BaseList {
 		let count_without_children = this.data.uniqBy((d) => d.name).length;
 
 		return frappe.db
-			.count(this.doctype, {
-				filters: this.get_filters_for_args(),
-				limit: this.count_upper_bound,
-			})
+			.count(
+				this.doctype,
+				{
+					filters: this.get_filters_for_args(),
+					limit: this.count_upper_bound,
+				},
+				Boolean(this.count_upper_bound)
+			)
 			.then((total_count) => {
-				this.total_count = total_count || current_count;
+				this.total_count = total_count;
 				this.count_without_children =
 					count_without_children !== current_count ? count_without_children : undefined;
 
 				let count_str;
 				if (this.total_count === this.count_upper_bound) {
 					count_str = `${format_number(this.total_count - 1, null, 0)}+`;
+				} else if (this.total_count == null) {
+					count_str = "??";
 				} else {
 					count_str = format_number(this.total_count, null, 0);
 				}
@@ -1777,7 +1803,7 @@ frappe.views.ListView = class ListView extends frappe.views.BaseList {
 		items.push({
 			label: __("Toggle Sidebar", null, "Button in list view menu"),
 			action: () => this.toggle_side_bar(),
-			condition: () => !this.hide_sidebar,
+			condition: () => !this.page.disable_sidebar_toggle,
 			standard: true,
 			shortcut: "Ctrl+K",
 		});

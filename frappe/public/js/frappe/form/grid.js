@@ -24,6 +24,9 @@ export default class Grid {
 		this.fieldinfo = {};
 		this.doctype = this.df.options;
 
+		this.sticky_row_sum = 71;
+		this.sticky_rows = [];
+
 		if (this.doctype) {
 			this.meta = frappe.get_meta(this.doctype);
 		}
@@ -74,9 +77,6 @@ export default class Grid {
 							<div class="grid-empty text-center text-extra-muted">
 								${__("No rows")}
 							</div>
-							<div class="grid-scroll-bar">
-								<div class="grid-scroll-bar-rows"></div>
-							</div>
 						</div>
 					</div>
 				</div>
@@ -122,10 +122,10 @@ export default class Grid {
 		frappe.utils.bind_actions_with_object(this.wrapper, this);
 
 		this.form_grid = this.wrapper.find(".form-grid");
-
 		this.setup_add_row();
 
 		this.setup_grid_pagination();
+		this.update_idx_and_name();
 
 		this.custom_buttons = {};
 		this.grid_buttons = this.wrapper.find(".grid-buttons");
@@ -146,6 +146,17 @@ export default class Grid {
 		} else {
 			description_wrapper.hide();
 		}
+	}
+
+	update_idx_and_name() {
+		this.data.forEach((d, ri) => {
+			if (d.idx === undefined) {
+				d.idx = ri + 1;
+			}
+			if (d.name === undefined) {
+				d.name = "row " + d.idx;
+			}
+		});
 	}
 
 	set_doc_url() {
@@ -1028,6 +1039,7 @@ export default class Grid {
 					if (column) {
 						column.in_list_view = 1;
 						column.columns = row.columns;
+						column.sticky = row.sticky;
 						return column;
 					}
 				})

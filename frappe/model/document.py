@@ -711,7 +711,7 @@ class Document(BaseDocument, DocRef):
 		self._fix_rating_value()
 		self._validate_code_fields()
 		self._sync_autoname_field()
-		self._extract_images_from_text_editor()
+		self._extract_images_from_editor()
 		self._sanitize_content()
 		self._save_passwords()
 		self.validate_workflow()
@@ -724,7 +724,7 @@ class Document(BaseDocument, DocRef):
 			d._fix_rating_value()
 			d._validate_code_fields()
 			d._sync_autoname_field()
-			d._extract_images_from_text_editor()
+			d._extract_images_from_editor()
 			d._sanitize_content()
 			d._save_passwords()
 		if self.is_new():
@@ -1106,7 +1106,8 @@ class Document(BaseDocument, DocRef):
 	def run_notifications(self, method):
 		"""Run notifications for this method"""
 		if (
-			(frappe.flags.in_import and frappe.flags.mute_emails)
+			method == "onload"
+			or (frappe.flags.in_import and frappe.flags.mute_emails)
 			or frappe.flags.in_patch
 			or frappe.flags.in_install
 		):
@@ -1117,20 +1118,20 @@ class Document(BaseDocument, DocRef):
 
 		from frappe.email.doctype.notification.notification import evaluate_alert
 
-		if self.flags.notifications is None:
+		def _get_notifications():
+			"""Return enabled notifications for the current doctype."""
 
-			def _get_notifications():
-				"""Return enabled notifications for the current doctype."""
+			return frappe.get_all(
+				"Notification",
+				fields=["name", "event", "method"],
+				filters={"enabled": 1, "document_type": self.doctype},
+			)
 
-				return frappe.get_all(
-					"Notification",
-					fields=["name", "event", "method"],
-					filters={"enabled": 1, "document_type": self.doctype},
-				)
+		notifications = frappe.client_cache.get_value(
+			f"notifications::{self.doctype}", generator=_get_notifications
+		)
 
-			self.flags.notifications = frappe.cache.hget("notifications", self.doctype, _get_notifications)
-
-		if not self.flags.notifications:
+		if not notifications:
 			return
 
 		def _evaluate_alert(alert):
@@ -1151,7 +1152,7 @@ class Document(BaseDocument, DocRef):
 			# value change is not applicable in insert
 			event_map["on_change"] = "Value Change"
 
-		for alert in self.flags.notifications:
+		for alert in notifications:
 			event = event_map.get(method, None)
 			if event and alert.event == event:
 				_evaluate_alert(alert)
@@ -1541,8 +1542,17 @@ class Document(BaseDocument, DocRef):
 				for df in doc.meta.get("fields", {"fieldtype": ["in", ["Currency", "Float", "Percent"]]})
 			)
 
+		# PERF: flt internally has to resolve this if we don't specify it.
+		rounding_method = frappe.get_system_settings("rounding_method")
 		for fieldname in fieldnames:
-			doc.set(fieldname, flt(doc.get(fieldname), self.precision(fieldname, doc.get("parentfield"))))
+			doc.set(
+				fieldname,
+				flt(
+					doc.get(fieldname),
+					self.precision(fieldname, doc.get("parentfield")),
+					rounding_method=rounding_method,
+				),
+			)
 
 	def get_url(self):
 		"""Return Desk URL for this document."""
