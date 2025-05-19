@@ -49,7 +49,7 @@ def print_has_permission_check_logs(func):
 		result = func(*args, **kwargs)
 
 		# print only if access denied
-		# and if user is checking his own permission
+		# and if user is checking their own permission
 		if not result and self_perm_check and print_logs:
 			msgprint(("<br>").join(frappe.flags.get("has_permission_check_logs", [])))
 
@@ -83,6 +83,7 @@ def has_permission(
 	parent_doctype=None,
 	print_logs=True,
 	debug=False,
+	ignore_share_permissions=False,
 ) -> bool:
 	"""Return True if user has permission `ptype` for given `doctype`.
 	If `doc` is passed, also check user, share and owner permissions.
@@ -190,7 +191,7 @@ def has_permission(
 
 		return False
 
-	if not perm:
+	if not perm and not ignore_share_permissions:
 		debug and _debug_log("Checking if document/doctype is explicitly shared with user")
 		perm = false_if_not_shared()
 
@@ -397,7 +398,7 @@ def has_user_permission(doc, user=None, debug=False):
 					msg = _(
 						"You are not allowed to access this {0} record because it is linked to {1} '{2}' in row {3}, field {4}"
 					).format(
-						_(meta.doctype),
+						_(meta.name),
 						_(field.options),
 						d.get(field.fieldname) or _("empty"),
 						d.idx,
@@ -408,7 +409,7 @@ def has_user_permission(doc, user=None, debug=False):
 					msg = _(
 						"You are not allowed to access this {0} record because it is linked to {1} '{2}' in field {3}"
 					).format(
-						_(meta.doctype),
+						_(meta.name),
 						_(field.options),
 						d.get(field.fieldname) or _("empty"),
 						_(field.label, context=field.parent) if field.label else field.fieldname,
@@ -833,3 +834,39 @@ def has_child_permission(
 
 def is_system_user(user: str | None = None) -> bool:
 	return frappe.get_cached_value("User", user or frappe.session.user, "user_type") == "System User"
+
+
+def check_doctype_permission(doctype: str, ptype: str = "read") -> None:
+	"""
+	Designed specfically to override DoesNotExistError in some scenarios.
+	Ignores share permissions.
+	"""
+
+	_message_log = frappe.local.message_log
+	frappe.local.message_log = []
+	try:
+		frappe.has_permission(doctype, ptype, throw=True, ignore_share_permissions=True)
+	except frappe.PermissionError:
+		frappe.flags.disable_traceback = True
+		raise
+
+	frappe.local.message_log = _message_log
+
+
+def handle_does_not_exist_error(fn):
+	"""
+	Decorator to override DoesNotExistError when handling exceptions.
+	Requires the first argument to be an Exception.
+	"""
+
+	@functools.wraps(fn)
+	def wrapper(e, *args, **kwargs):
+		if isinstance(e, frappe.DoesNotExistError) and (doctype := getattr(e, "doctype", None)):
+			try:
+				check_doctype_permission(doctype)
+			except frappe.PermissionError as _e:
+				return fn(_e, *args, **kwargs)
+
+		return fn(e, *args, **kwargs)
+
+	return wrapper

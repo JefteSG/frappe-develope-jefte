@@ -23,6 +23,13 @@
 		background-color: var(--subtle-fg);
 		border-top-left-radius: var(--border-radius-md);
 		border-top-right-radius: var(--border-radius-md);
+
+		.row-check {
+			border-top-left-radius: var(--border-radius-md);
+		}
+		.row .col:last-child {
+			border-top-right-radius: var(--border-radius-md);
+		}
 	}
 
 	&.with-filter {
@@ -367,11 +374,13 @@
 			height: 40px;
 		}
 	}
-	.awesomplete > ul {
-		position: fixed !important;
-		left: auto !important;
-		top: auto;
-		width: 250px !important;
+	.grid-row:not(.grid-row-open) {
+		.awesomplete > ul {
+			position: fixed !important;
+			left: auto !important;
+			top: auto;
+			width: 250px !important;
+		}
 	}
 	.grid-static-col {
 		background-color: var(--fg-color);
@@ -405,11 +414,6 @@
 	background-color: var(--fg-color);
 
 	@include transition(0.2s);
-	// REDESIGN TODO: Fix border bottom for last item
-	&:last-child {
-		border-bottom-left-radius: var(--border-radius);
-		border-bottom-right-radius: var(--border-radius);
-	}
 
 	td {
 		vertical-align: top;
@@ -501,10 +505,19 @@
 .grid-row-open .form-in-grid {
 	opacity: 1;
 	height: auto;
-	overflow: visible;
-	margin: 0px calc(-1 * var(--margin-md));
+	overflow: auto;
+	margin: auto;
 	padding: var(--padding-sm) var(--padding-md);
 	max-width: 865px;
+	position: fixed;
+	top: 5%;
+	left: 50%;
+	transform: translate(-50%, 0%);
+	width: 100%;
+	.grid-form-body {
+		max-height: 80vh;
+		overflow: scroll;
+	}
 }
 
 .grid-form-heading {

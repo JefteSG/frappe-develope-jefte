@@ -29,7 +29,9 @@ frappe.ui.toolbar.Toolbar = class {
 		this.bind_events();
 		$(document).trigger("toolbar_setup");
 		$(".navbar-brand .app-logo").on("click", () => {
+			frappe.app.sidebar.set_height();
 			frappe.app.sidebar.toggle_sidebar();
+			frappe.app.sidebar.prevent_scroll();
 		});
 	}
 

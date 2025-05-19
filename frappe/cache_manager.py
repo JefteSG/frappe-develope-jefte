@@ -6,7 +6,6 @@ import frappe
 common_default_keys = ["__default", "__global"]
 
 doctypes_for_mapping = {
-	"Energy Point Rule",
 	"Assignment Rule",
 	"Milestone Tracker",
 	"Document Naming Rule",
@@ -66,7 +65,6 @@ user_cache_keys = (
 )
 
 doctype_cache_keys = (
-	"doctype_form_meta",
 	"last_modified",
 	"linked_doctypes",
 	"workflow",
@@ -139,6 +137,9 @@ def _clear_doctype_cache_from_redis(doctype: str | None = None):
 
 		def clear_single(dt):
 			frappe.clear_document_cache(dt)
+			# Wild card for all keys containing this doctype.
+			# this can be excessive but this function isn't called often... ideally.
+			frappe.client_cache.delete_keys(f"*{dt}*")
 			frappe.cache.hdel_names(doctype_cache_keys, dt)
 			clear_meta_cache(dt)
 
@@ -201,13 +202,24 @@ def build_table_count_cache():
 	):
 		return
 
-	table_name = frappe.qb.Field("table_name").as_("name")
-	table_rows = frappe.qb.Field("table_rows").as_("count")
-	information_schema = frappe.qb.Schema("information_schema")
+	if frappe.db.db_type != "sqlite":
+		table_name = frappe.qb.Field("table_name").as_("name")
+		table_rows = frappe.qb.Field("table_rows").as_("count")
+		information_schema = frappe.qb.Schema("information_schema")
 
-	data = (frappe.qb.from_(information_schema.tables).select(table_name, table_rows)).run(as_dict=True)
-	counts = {d.get("name").replace("tab", "", 1): d.get("count", None) for d in data}
-	frappe.cache.set_value("information_schema:counts", counts)
+		data = (frappe.qb.from_(information_schema.tables).select(table_name, table_rows)).run(as_dict=True)
+		counts = {d.get("name").replace("tab", "", 1): d.get("count", None) for d in data}
+		frappe.cache.set_value("information_schema:counts", counts)
+	else:
+		counts = {}
+		name = frappe.qb.Field("name")
+		type = frappe.qb.Field("type")
+		sqlite_master = frappe.qb.Schema("sqlite_master")
+		data = frappe.qb.from_(sqlite_master).select(name).where(type == "table").run(as_dict=True)
+		for table in data:
+			count = frappe.db.sql(f"SELECT COUNT(*) FROM `{table.name}`")[0][0]
+			counts[table.name.replace("tab", "", 1)] = count
+		frappe.cache.set_value("information_schema:counts", counts)
 
 	return counts
 

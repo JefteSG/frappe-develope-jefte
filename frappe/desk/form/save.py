@@ -28,10 +28,10 @@ def savedocs(doc, action):
 
 	# action
 	doc.docstatus = {
-		"Save": DocStatus.draft(),
-		"Submit": DocStatus.submitted(),
-		"Update": DocStatus.submitted(),
-		"Cancel": DocStatus.cancelled(),
+		"Save": DocStatus.DRAFT,
+		"Submit": DocStatus.SUBMITTED,
+		"Update": DocStatus.SUBMITTED,
+		"Cancel": DocStatus.CANCELLED,
 	}[action]
 
 	if doc.docstatus.is_submitted():
@@ -47,7 +47,8 @@ def savedocs(doc, action):
 	send_updated_docs(doc)
 
 	add_data_to_monitor(doctype=doc.doctype, action=action)
-	frappe.msgprint(frappe._("Saved"), indicator="green", alert=True)
+	status_message = "Submitted" if doc.docstatus.is_submitted() else "Saved"
+	frappe.msgprint(frappe._(status_message), indicator="green", alert=True)
 
 
 @frappe.whitelist()

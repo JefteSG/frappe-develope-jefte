@@ -22,6 +22,7 @@ import frappe.utils.response
 from frappe import _
 from frappe.auth import SAFE_HTTP_METHODS, UNSAFE_HTTP_METHODS, HTTPRequest, check_request_ip, validate_auth
 from frappe.middlewares import StaticDataMiddleware
+from frappe.permissions import handle_does_not_exist_error
 from frappe.utils import CallbackManager, cint, get_site_name
 from frappe.utils.data import escape_html
 from frappe.utils.error import log_error, log_error_snapshot
@@ -242,7 +243,7 @@ def process_response(response: Response):
 		return
 
 	# Default for all requests is no-cache unless explicitly opted-in by endpoint
-	response.headers.update(NO_CACHE_HEADERS)
+	response.headers.setdefault("Cache-Control", NO_CACHE_HEADERS["Cache-Control"])
 
 	# rate limiter headers
 	if hasattr(frappe.local, "rate_limiter"):
@@ -323,6 +324,7 @@ def make_form_dict(request: Request):
 		frappe.throw(_("Invalid request arguments"))
 
 
+@handle_does_not_exist_error
 def handle_exception(e):
 	response = None
 	http_status_code = getattr(e, "http_status_code", 500)
@@ -475,7 +477,7 @@ def serve(
 	from werkzeug.serving import run_simple
 
 	if profile or os.environ.get("USE_PROFILER"):
-		application = ProfilerMiddleware(application, sort_by=("cumtime", "calls"))
+		application = ProfilerMiddleware(application, sort_by=("cumtime", "calls"), restrictions=(200,))
 
 	if not os.environ.get("NO_STATICS"):
 		application = application_with_statics()

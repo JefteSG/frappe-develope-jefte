@@ -22,8 +22,8 @@ from frappe.utils.bench_helper import CliCtxObj
 @click.option(
 	"--db-type",
 	default="mariadb",
-	type=click.Choice(["mariadb", "postgres"]),
-	help='Optional "postgres" or "mariadb". Default is "mariadb"',
+	type=click.Choice(["mariadb", "postgres", "sqlite"]),
+	help='Optional "sqlite", "postgres" or "mariadb". Default is "mariadb"',
 )
 @click.option("--db-host", help="Database Host")
 @click.option("--db-port", type=int, help="Database Port")
@@ -379,6 +379,11 @@ def partial_restore(context: CliCtxObj, sql_file_path, verbose, encryption_key=N
 	verbose = context.verbose or verbose
 	frappe.init(site)
 	frappe.connect()
+
+	if frappe.conf.db_type == "sqlite":
+		click.secho("Partial restore is not supported for SQLite databases", fg="red")
+		sys.exit(1)
+
 	err, out = frappe.utils.execute_in_shell(f"file {sql_file_path}", check_exit_code=True)
 	if err:
 		click.secho("Failed to detect type of backup file", fg="red")
@@ -567,23 +572,12 @@ def list_apps(context: CliCtxObj, format):
 @pass_context
 def add_db_index(context: CliCtxObj, doctype, column):
 	"Adds a new DB index and creates a property setter to persist it."
-	from frappe.custom.doctype.property_setter.property_setter import make_property_setter
-
 	columns = column  # correct naming
 	for site in context.sites:
 		frappe.init(site)
 		frappe.connect()
 		try:
 			frappe.db.add_index(doctype, columns)
-			if len(columns) == 1:
-				make_property_setter(
-					doctype,
-					columns[0],
-					property="search_index",
-					value="1",
-					property_type="Check",
-					for_doctype=False,  # Applied on docfield
-				)
 			frappe.db.commit()
 		finally:
 			frappe.destroy()
